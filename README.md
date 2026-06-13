@@ -1,222 +1,231 @@
-
-
 # wg-du
+
 WireGuard 动态更新（Dynamic Update）
----
+
 ![Shell Script](https://img.shields.io/badge/shell-script-green?logo=gnu-bash)
 ![License](https://img.shields.io/github/license/techsir-cn/wg-du)
 
-
-# README.md
-
-**WireGuard 动态更新 技术规范**  
-**说明：一个脚本，它通过强制解析Dns的方法，监测Endpoint域名对应的ip地址变动情况，并且使用变动后的最新ip地址，动态更新对端的Endpoint信息，在不重新启动WireGuard接口的情况下，维持隧道的通信**  
-**版本：v1.2**  
-**最后更新：2026-02-27**
+**WireGuard 动态更新**  
+**说明：自动检测公网 IP 变动，动态更新 WireGuard Peer Endpoint，无需重启接口**  
+**版本：v2.0**  
+**最后更新：2026-06-13**
 
 ---
 
 ## 1. 目标
 
-wireguard-tools软件包，或者说wg-quick工具，有一个固有限制，就是它**仅在接口启动时解析 Endpoint 域名一次**，当 Peer 信息中的Endpoint使用的是 DDNS， 且该域名对应的公网 IP 变更后，连接会被迫中断，必须重启wg接口才可以。本项目就是为了解决这个问题。
+wireguard-tools 的 `wg-quick` 仅在接口启动时解析 Endpoint 一次。当对端使用 DDNS 域名且 IP 变更后，连接中断，必须重启接口。v2.0 彻底解决了这个问题。
 
-本方案通过定时脚本，执行如下动作：
-
-- 从指定的DNS服务器查询获取域名对应的最新 IP
-- 与当前WG接口的当前Peer 运行时的 Endpoint 信息进行比较
-- 若不同，则用 `wg set` 动态更新，**而无需重启接口**
-- 可以指定权威DNS服务器，规避TTL和递归所需的时间
+v2.0 新增 **server 角色**——不仅能监控对端域名 IP（client），还能检测**本机公网 IP 变化**并在变化后通知所有 server 类 Peer 重连，形成一个完整的双向 IP 变动闭环。
 
 ---
 
-## 2. 核心原则
+## 2. 核心特性
 
-| 原则 | 说明 |
+| 特性 | 说明 |
 |------|------|
-| **权威 DNS 直连** | 可选指定使用域名对应的权威 DNS 服务器（如 `dns17.hichina.com`），**通过权威DNS而不是公共递归 DNS**（如 223.5.5.5）可以有效规避 TTL 缓存延迟 |
-| **IP 版本严格匹配** | 当前 Endpoint 是 IPv4 → 仅查 A 记录；是 IPv6 → 仅查 AAAA 记录；**禁止跨版本替换** |
-| **CNAME 透明处理** | 无需特殊逻辑，`dig +short` 自动递归解析 CNAME 至最终 A/AAAA 记录 |
-| **配置内聚** | 每个 Peer 的PublicKey、Endpoint的域名:端口、指定 DNS 作为一组配置项，绑定WG接口和Peer，避免全局变量污染 |
-| **零外部依赖** | 所有参数写在脚本头部，**不读取外部配置文件** |
+| **双角色支持** | 带 Endpoint 的 Peer → **client**（监控域名 IP）/ 无 Endpoint 的 Peer → **server**（监控本机 IP） |
+| **自动配置解析** | 自动从 `wg0.conf` 或 OpenWrt `/etc/config/network` 解析 Peer，通过 `#name` 标记识别 |
+| **交互式配置向导** | `wg-du --setup` 一键交互配置，自动检测、自动写入 |
+| **配置检查** | `wg-du --check` 检查配置错误与遗漏 |
+| **权威 DNS 直连** | 可选权威 DNS，规避 TTL 缓存延迟 |
+| **IP 版本严格匹配** | IPv4 → A 记录；IPv6 → AAAA 记录 |
+| **公网 IP 检测** | 多 URL 轮询获取本机公网 IPv4/IPv6 |
+| **零中断更新** | `wg set` 动态更新，无需重启接口 |
 
 ---
 
-## 3. 配置格式
+## 3. 角色说明
 
-脚本头部必须按以下结构定义（支持多接口、多 Peer）：
+```
+有一个 WireGuard 网络：
+
+┌──────────────┐         ┌──────────────┐
+│  服务器节点   │ ◄─────► │  客户端节点   │
+│  有公网 IP    │         │  动态 IP     │
+│  (server 角色)│         │  (client 角色)│
+└──────────────┘         └──────────────┘
+
+client：对端有域名 → 监控域名 IP 变化，更新本地 Endpoint
+server：对端无域名 → 监控本机公网 IP 变化，触发对端重建连接
+```
+
+### 判断规则
+
+| 条件 | 角色 |
+|------|------|
+| `[Peer]` 中有 `Endpoint = domain:port` | **client** |
+| `[Peer]` 中没有 Endpoint | **server** |
+
+配置文件中无需手动指定角色，脚本根据是否有 Endpoint 自动判断。
+
+---
+
+## 4. 配置方法（二选一）
+
+### 方式 A：交互式配置（推荐）
 
 ```sh
-# === WG-DU 接口1配置区 ===
+sudo wg-du --setup
+```
+
+向导会自动完成：
+1. 检测 `wg0.conf` 或 OpenWrt `/etc/config/network`
+2. 列出所有配置了 `#name` 的 Peer
+3. 对每个 client Peer 询问 DNS 服务器和 Ping IP
+4. 将配置写入脚本头部
+5. 可选配置 cron 定时任务
+
+### 方式 B：手动配置
+
+编辑脚本头部配置区：
+
+```sh
+# === wg-du 配置区 ===
 INTERFACE="wg0"
 LOG_FILE="/etc/wireguard/wg-du.log"
+CHECK_IP_URLS_V4="https://ddns.oray.com/checkip http://v4.66666.host:66/ip https://4.ipw.cn https://ip.3322.net"
+CHECK_IP_URLS_V6="http://v6.66666.host:66/ip https://myip.ipip.net"
 
-# Peer 0（必须启用）
-PEER_0_PUBLIC_KEY="your public key"
-PEER_0_ENDPOINT="your.domain.com:51820"
-PEER_0_DNS_SERVER="dns17.hichina.com"
-
-# Peer 1（按需取消注释）
-#PEER_1_PUBLIC_KEY="TrMv...WXX0="
-#PEER_1_ENDPOINT="node.example.com:51820"
-#PEER_1_DNS_SERVER="dns18.hichina.com"
-# === WG-DU 接口1配置区结束
-
-# === WG-DU 接口2配置区（复制上一段，改 INTERFACE="wg1"）===
+PEER_LD_ROLE="server"
+PEER_MT_ROLE="client"
+PEER_MT_DNS_SERVER="dns17.hichina.com"
+PEER_MT_PING_IP="10.10.10.3"
+# === wg-du 配置区结束 ===
 ```
 
-### 字段说明
+然后在 `wg0.conf` 中为每个 Peer 添加 `#name` 标记：
 
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `INTERFACE` | 是 | WireGuard 接口名（如 `wg0`） |
-| `LOG_FILE` | 是 | **默认硬编码为 `/etc/wireguard/wg-du.log`**，脚本启动时自动创建目录 |
-| `PEER_N_PUBLIC_KEY` | 是 | Peer 公钥（从 `wg0.conf` 复制，**必须与 `wg show` 输出一致**） |
-| `PEER_N_ENDPOINT` | 是 | 格式：`域名:端口`（与 `wg0.conf` 中 Endpoint 完全一致） |
-| `PEER_N_DNS_SERVER` | 是 | 该域名的**权威 DNS 服务器**（如阿里云分配的 `dns17.hichina.com`）可以在域名服务商的控制台内查看，如果不知道，就填公共DNS服务器，但是可能会受到TTL和递归时间的影响 |
-
-> **命名规则**：  
-> - Peer 索引从 `0` 开始连续编号（`PEER_0_*`, `PEER_1_*`, ...）  
-> - 多接口场景：复制整个配置区块，仅修改 `INTERFACE`  
+```ini
+[Peer]
+#name = MT
+PublicKey = xxxx
+Endpoint = your.domain.com:51820
+AllowedIPs = 10.10.10.3/32
+```
 
 ---
 
-## 4. 处理逻辑
+## 5. 处理逻辑
 
-### 4.1 IP 版本检测
+### 5.1 Client 模式
 
-- 从 `wg show $INTERFACE` 提取当前 Peer 的 endpoint（格式：`IP:PORT` 或 `[IPv6]:PORT`）
-- **IPv4 判定**：endpoint 字符串不含 `[` 且包含 `.`（如 `192.168.1.1:51820`）
-- **IPv6 判定**：endpoint 字符串包含 `[` 和 `]`（如 `[2001::1]:51820`）
+1. 从 `wg show` 获取当前 Endpoint IP
+2. 判定 IP 版本，用 `dig` 查询对应 A/AAAA 记录
+3. 若 IP 不同，执行 `wg set` 更新 Endpoint
+4. 如果配置了 PING_IP，更新后 Ping 触发握手
 
-### 4.2 DNS 查询规则
+### 5.2 Server 模式
 
-| 当前 IP 版本 | DNS 查询命令 |
-|--------------|--------------|
-| IPv4 | `dig +short A "@$PEER_N_DNS_SERVER" "$domain"` |
-| IPv6 | `dig +short AAAA "@$PEER_N_DNS_SERVER" "$domain"` |
+1. 通过多 URL 轮询获取本机公网 IP
+2. 与 `/tmp/wg-du-ip.${INTERFACE}` 中记录的上次 IP 比较
+3. 若不同，执行 `wg set ... endpoint 0.0.0.0:0` 使对端重建连接
 
-> **关键行为**：  
-> - `dig +short` 自动处理 CNAME 递归，返回最终 IP  
-> - 仅取**第一个结果**（`head -n1`），忽略多记录场景  
+### 5.3 更新条件
 
-### 4.3 更新条件
-
-仅当同时满足以下条件时执行 `wg set`：
-
-1. 新 IP 与当前 IP **字符串不相等**
-2. 新 IP 为有效 IP 地址（非空、非错误响应）
+仅当新 IP 与当前 IP **字符串不相等**且非空时执行更新。
 
 ---
 
-## 5. 日志规范
-
-每次执行必须记录以下信息到 `LOG_FILE`：
+## 6. 日志规范
 
 ```
-YYYY-MM-DD_HH:MM:SS|PeerN|domain|ago=IP:PORT|aft=IP:PORT|same/diff
+YYYY-MM-DD_HH:MM:SS|PeerName|domain|ago=IP:PORT|aft=IP:PORT|same/diff
 ```
 
-- **diff** 时，表示已执行更新操作
+- `|diff` 表示执行了更新
+- `|same` 表示 IP 无变化
 
 ---
 
-## 6. 兼容性要求
+## 7. 命令说明
+
+| 命令 | 说明 |
+|------|------|
+| `wg-du` | 执行 DDNS 更新（用于 cron 定时任务） |
+| `wg-du --setup` | 交互式配置向导 |
+| `wg-du --check` | 检查配置错误 |
+| `wg-du -h` | 显示帮助 |
+| `wg-du -p` | 仅显示变动记录 |
+| `wg-du -p -a` | 显示全部日志 |
+
+---
+
+## 8. 兼容性要求
 
 | 环境 | 要求 |
 |------|------|
 | **Shell** | POSIX `/bin/sh`（兼容 OpenWrt BusyBox 和 Linux bash） |
-| **依赖工具** | `wg`, `dig`, `grep`, `awk`, `cut`, `head`（OpenWrt 默认包含） |
-| **文件命名** | 仅允许字母、数字、连字符（如 `wg-du`） |
+| **依赖工具** | `wg`, `dig`, `curl`, `ping`, `awk`, `cut`, `head` |
+| **配置文件** | `wg0.conf`（标准 WireGuard 格式）或 OpenWrt `/etc/config/network` |
 
 ---
 
-## 7. 版本记录
+## 9. 部署方法
+
+### 步骤 1：下载脚本
+
+```sh
+wget https://github.com/techsir-cn/wg-du/releases/download/v2.0/wg-du -O wg-du && chmod +x wg-du
+```
+
+加速下载：
+
+```sh
+wget https://ghfast.top/https://github.com/techsir-cn/wg-du/releases/download/v2.0/wg-du -O wg-du && chmod +x wg-du
+```
+
+### 步骤 2：在 wg0.conf 中添加 #name
+
+为每个要监控的 `[Peer]` 段落添加 `#name = 名称`：
+
+```ini
+[Peer]
+#name = MyServer
+PublicKey = xxxx
+Endpoint = example.com:51820
+AllowedIPs = 10.0.0.2/32
+```
+
+### 步骤 3：运行配置向导
+
+```sh
+sudo ./wg-du --setup
+```
+
+按提示完成配置。
+
+### 步骤 4：安装 dig（如需要）
+
+```sh
+# Debian/Ubuntu
+sudo apt install dnsutils
+
+# OpenWrt
+opkg update && opkg install bind-dig
+```
+
+### 步骤 5：查看日志与状态
+
+```sh
+wg-du -p        # 查看变动记录
+wg-du -p -a     # 查看全部日志
+cat /etc/wireguard/wg-du.log
+```
+
+---
+
+## 10. 版本记录
 
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
-| v1.2 | 2026-02-27 | 日志格式优化：去除空格和[wg-du]，新增端口记录，ago/aft 字段便于排查问题 |
-| v1.1 | 2026-02-19 | 项目更名为 wg-du；日志标识简化为 same/diff；支持命令行选项（-h/-p/-install）；自动创建 /etc/wireguard 目录；帮助信息含双语 cron 与服务管理指引 |
-| v1.0 | 2026-02-12 | 初始定稿：包含配置格式、DNS 规则、IP 版本匹配、CNAME 处理、多 Peer/接口支持 |
+| v2.0 | 2026-06-13 | 重构为双角色架构（client/server）；自动从 wg0.conf 解析 Peer（#name 标记）；新增 `--setup` 交互式配置向导；新增 `--check` 配置检查；新增 server 模式公网 IP 检测；新增 OpenWrt `/etc/config/network` 支持；依赖新增 curl/ping |
+| v1.2 | 2026-02-27 | 日志格式优化：去除空格和标识，新增端口记录，ago/aft 字段 |
+| v1.1 | 2026-02-19 | 项目更名为 wg-du；日志标识简化为 same/diff；支持命令行选项 |
+| v1.0 | 2026-02-12 | 初始定稿 |
 
 ---
 
-## 8. 部署方法（适用于所有系统）
+## License
 
-### 步骤 1：准备目录
-```sh
-mkdir -p /etc/wireguard
-```
-
-### 步骤 2：下载并授权脚本
-```sh
-wget https://github.com/techsir-cn/wg-du/releases/download/v1.2/wg-du -O wg-du && chmod +x wg-du
-```
-如果网络有问题不能下载，则可以使用加速器下载
-```sh
-wget https://ghfast.top/https://github.com/techsir-cn/wg-du/releases/download/v1.2/wg-du -O wg-du && chmod +x wg-du
-```
-
-### 步骤 3：安装到系统路径（可选但推荐）
-```sh
-sudo ./wg-du -install
-```
-此命令将：
-- 复制脚本到 `/usr/bin/wg-du`
-- 自动创建 `/etc/wireguard/` 目录
-- 打印详细的 cron 与服务管理命令（中英文）
-
-### 步骤 4：配置定时任务
-```sh
-crontab -e
-```
-打开的编辑器，类似于vi编辑器，命令格式通用。
-进入编辑器，按"i"进入编辑模式，添加以下行：
-```cron
-*/5 * * * * wg-du
-```
-然后按esc进入命令模式，在出现的:后面输入wq后回车，即可保持并退出；
-可以使用以下命令来验证是否加入了计划任务：
-```sh
-crontab -l
-```
-正确的话，会显示和你输入一样的内容，比如：*/5 * * * * wg-du
-
-设置cron开机自启动
-```sh
-/etc/init.d/cron enable
-```
-手动启动cron
-```sh
-/etc/init.d/cron start
-```
-检查是否运行
-```sh
-/etc/init.d/cron status
-```
-应该显示
-running
-则代表cron已经开始运行，每5分钟会自动执行一次
-
-或者使用luci界面来操作cron计划任务
-
-### 步骤 5：安装dig工具
-有些openwrt系统没有内置dig工具的，输入以下命令安装
-```sh
-opkg update
-opkg install bind-dig
-```
-
-### 步骤 6：查看日志与状态
-- 查看变动记录：`wg-du -p`
-- 查看全部日志：`wg-du -p -a`
-- 查看帮助：`wg-du -h`
-
-> ✅ **完成！**  
-> - 日志自动写入 `/etc/wireguard/wg-du.log`
-> - 可以输入`cat /etc/wireguard/wg-du.log或者在/etc/wireguard目录下输入cat wg-du.log`来查看日志，每5分钟自动执行一次都会有记录
-> - 无需区分 Linux/OpenWrt  
-> - 无需 systemd/init.d 配置
-
----
-
-> **此文档为唯一实现依据**。任何脚本生成必须严格遵循本规范，不得擅自修改配置格式或核心逻辑。
+MIT
