@@ -1,30 +1,26 @@
 #!/bin/sh
-# wg-du v1.2
+# wg-du v2.0
 # WireGuard 动态更新 (Dynamic Update)
-# Specification: https://github.com/techsir-cn/wg-du
 
-# === WG-DU 接口1配置区 ===
+
+
+# === wg-du 配置区 ===
+# 增强配置：每个 peer 通过 #name 与 wg0.conf 关联
+# 格式: PEER_<name>_ROLE=client|server
+#       PEER_<name>_DNS_SERVER=<dns>  (client only, required)
+#       PEER_<name>_PING_IP=<ip>      (client only, optional)
+
 INTERFACE="wg0"
 LOG_FILE="/etc/wireguard/wg-du.log"
+CHECK_IP_URLS_V4="https://ddns.oray.com/checkip http://v4.66666.host:66/ip https://4.ipw.cn https://ip.3322.net"
+CHECK_IP_URLS_V6="http://v6.66666.host:66/ip https://myip.ipip.net"
 
-# Peer 0..................
-PEER_0_PUBLIC_KEY="GcMtEolX36ldUFRrgz2zcpaeoOkRGXA8bk0ZdyzBuBo="
-PEER_0_ENDPOINT="rb.changwei.online:51820"
-PEER_0_DNS_SERVER="dns17.hichina.com"
+PEER_LD_ROLE="server"
+PEER_MT_ROLE="server"
+PEER_iPhone_ROLE="server"
+PEER_x1c_ROLE="server"
 
-# Peer 1（按需取消注释）
-#PEER_1_PUBLIC_KEY="TrMv...WXX0="
-#PEER_1_ENDPOINT="mt-node.example.com:51820"
-#PEER_1_DNS_SERVER="dns18.hichina.com"
-# === WG-DU 接口1配置区结束
-
-# === WG-DU 接口2配置区（复制上一段，改 INTERFACE="wg1"）===
-#INTERFACE="wg1"
-#LOG_FILE="/etc/wireguard/wg-du-wg1.log"
-#PEER_0_PUBLIC_KEY="..."
-#PEER_0_ENDPOINT="..."
-#PEER_0_DNS_SERVER="..."
-# === WG-DU 接口2配置区结束
+# === wg-du 配置区结束 ===
 
 # =============================================================================
 # 以下为脚本逻辑，用户无需修改
@@ -33,6 +29,20 @@ PEER_0_DNS_SERVER="dns17.hichina.com"
 log() {
     mkdir -p "$(dirname "$LOG_FILE")"
     printf '%s|%s\n' "$(date '+%Y-%m-%d_%H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+check_deps() {
+    missing=""
+    for cmd in wg dig awk cut ping curl; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing="$missing $cmd"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        echo "Error: Missing required commands:$missing" >&2
+        echo "Install them and try again." >&2
+        exit 1
+    fi
 }
 
 get_current_endpoint() {
@@ -62,23 +72,262 @@ update_peer_endpoint() {
     wg set "$INTERFACE" peer "$public_key" endpoint "$new_ip:$port"
 }
 
+parse_wg0_conf() {
+    CONFIG_FILE=""
+    CONFIG_TYPE=""
+    if [ -f /etc/wireguard/wg0.conf ]; then
+        CONFIG_FILE="/etc/wireguard/wg0.conf"
+        CONFIG_TYPE="wg"
+    elif [ -f /etc/config/network ]; then
+        CONFIG_FILE="/etc/config/network"
+        CONFIG_TYPE="openwrt"
+    else
+        log "ERROR: No wg0.conf or /etc/config/network found"
+        exit 1
+    fi
+
+    PEER_COUNT=0
+    if [ "$CONFIG_TYPE" = "wg" ]; then
+        _parse_wg_conf
+    else
+        _parse_openwrt_network
+    fi
+
+    PEER_COUNT=$(wc -l < /tmp/wg-du-peers.$$)
+
+    if [ "$PEER_COUNT" -eq 0 ]; then
+        log "ERROR: No peers found in $CONFIG_FILE"
+        exit 1
+    fi
+
+    if [ "$CONFIG_TYPE" = "wg" ]; then
+        local total_peers
+        total_peers=$(grep -c '^\[Peer\]' "$CONFIG_FILE" 2>/dev/null || echo 0)
+        if [ "$total_peers" -gt "$PEER_COUNT" ]; then
+            log "WARNING: $((total_peers - PEER_COUNT)) peer(s) without #name in $CONFIG_FILE"
+        fi
+    fi
+}
+
+_parse_wg_conf() {
+    awk '
+    /^\[Peer\]/ {
+        if (name != "") print name "|" pk "|" ep "|" aip "|" pkp
+        name=""; pk=""; ep=""; aip=""; pkp=""
+        in_peer=1
+        next
+    }
+    in_peer && /^[[:space:]]*#name[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, ""); name=$0
+    }
+    in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, ""); pk=$0
+    }
+    in_peer && /^[[:space:]]*Endpoint[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, ""); ep=$0
+    }
+    in_peer && /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, ""); aip=$0
+    }
+    in_peer && /^[[:space:]]*PersistentKeepalive[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, ""); pkp=$0
+    }
+    END {
+        if (name != "") print name "|" pk "|" ep "|" aip "|" pkp
+    }
+    ' "$CONFIG_FILE" > /tmp/wg-du-peers.$$
+}
+
+_parse_openwrt_network() {
+    awk '
+    BEGIN { in_peer=0; name=""; pk=""; ep_host=""; ep_port=""; aip=""; pkp="" }
+    /^config wireguard_wg0/ {
+        if (name != "" && !disabled) {
+            ep = (ep_host != "" && ep_port != "") ? ep_host ":" ep_port : ""
+            print name "|" pk "|" ep "|" aip "|" pkp
+        }
+        name=""; pk=""; ep_host=""; ep_port=""; aip=""; pkp=""; disabled=0; in_peer=1
+        next
+    }
+    in_peer && /^[[:space:]]*option description '\''/ {
+        gsub(/.*option description '\''/, ""); gsub(/'\''.*/, ""); name=$0
+    }
+    in_peer && /^[[:space:]]*option public_key '\''/ {
+        gsub(/.*option public_key '\''/, ""); gsub(/'\''.*/, ""); pk=$0
+    }
+    in_peer && /^[[:space:]]*option endpoint_host '\''/ {
+        gsub(/.*option endpoint_host '\''/, ""); gsub(/'\''.*/, ""); ep_host=$0
+    }
+    in_peer && /^[[:space:]]*option endpoint_port '\''/ {
+        gsub(/.*option endpoint_port '\''/, ""); gsub(/'\''.*/, ""); ep_port=$0
+    }
+    in_peer && /^[[:space:]]*list allowed_ips '\''/ {
+        gsub(/.*list allowed_ips '\''/, ""); gsub(/'\''.*/, "")
+        if (aip == "") aip=$0; else aip=aip", "$0
+    }
+    in_peer && /^[[:space:]]*option persistent_keepalive '\''/ {
+        gsub(/.*option persistent_keepalive '\''/, ""); gsub(/'\''.*/, ""); pkp=$0
+    }
+    in_peer && /^[[:space:]]*option disabled '\''1'\''/ { disabled=1 }
+    END {
+        if (name != "" && !disabled) {
+            ep = (ep_host != "" && ep_port != "") ? ep_host ":" ep_port : ""
+            print name "|" pk "|" ep "|" aip "|" pkp
+        }
+    }
+    ' "$CONFIG_FILE" > /tmp/wg-du-peers.$$
+}
+
+load_peer() {
+    local name="$1"
+    local line
+    line=$(awk -F'|' -v n="$name" '$1 == n {print; exit}' /tmp/wg-du-peers.$$)
+    if [ -z "$line" ]; then
+        return 1
+    fi
+    PEER_PUBLIC_KEY=$(echo "$line" | cut -d'|' -f2)
+    PEER_ENDPOINT=$(echo "$line" | cut -d'|' -f3)
+    PEER_ALLOWED_IPS=$(echo "$line" | cut -d'|' -f4)
+    PEER_KEEPALIVE=$(echo "$line" | cut -d'|' -f5)
+    return 0
+}
+
+trigger_handshake() {
+    local ping_ip="$1"
+    if [ -n "$ping_ip" ]; then
+        ping -c 1 -W 3 "$ping_ip" >/dev/null 2>&1
+    fi
+}
+
+run_client() {
+    local name="$1"
+    load_peer "$name" || return 1
+
+    local dns_server ping_ip domain port current_endpoint current_ip record_type resolved_ip
+    eval "dns_server=\$PEER_${name}_DNS_SERVER"
+    eval "ping_ip=\$PEER_${name}_PING_IP"
+
+    if [ -z "$dns_server" ]; then
+        log "Peer $name: ERROR - DNS_SERVER not configured for client peer"
+        return 1
+    fi
+
+    if [ -z "$PEER_ENDPOINT" ]; then
+        log "Peer $name: ERROR - No Endpoint in wg0.conf for client peer"
+        return 1
+    fi
+
+    domain="${PEER_ENDPOINT%:*}"
+    port="${PEER_ENDPOINT##*:}"
+    if [ "$domain" = "$PEER_ENDPOINT" ]; then
+        log "Peer $name: ERROR - Invalid endpoint format (expected domain:port)"
+        return 1
+    fi
+
+    current_endpoint=$(get_current_endpoint "$PEER_PUBLIC_KEY")
+    if [ -z "$current_endpoint" ]; then
+        log "Peer $name: ERROR - Peer not found in wg show $INTERFACE output"
+        return 1
+    fi
+
+    if echo "$current_endpoint" | grep -q '\['; then
+        current_ip=$(echo "$current_endpoint" | sed 's/^\[\([^]]*\)\]:[0-9]*$/\1/')
+        record_type="AAAA"
+    else
+        current_ip=$(echo "$current_endpoint" | cut -d: -f1)
+        record_type="A"
+    fi
+
+    resolved_ip=$(resolve_ip "$domain" "$dns_server" "$record_type")
+    if [ -z "$resolved_ip" ]; then
+        log "Peer $name: ERROR - DNS query failed for $domain ($record_type via $dns_server)"
+        return 1
+    fi
+
+    if [ "$resolved_ip" != "$current_ip" ]; then
+        if ! update_peer_endpoint "$PEER_PUBLIC_KEY" "$resolved_ip" "$port"; then
+            log "Peer $name: ERROR - wg set failed"
+            return 1
+        fi
+        trigger_handshake "$ping_ip"
+        log "Peer${name}|$domain|ago=${current_ip}:${port}|aft=${resolved_ip}:${port}|diff"
+    else
+        log "Peer${name}|$domain|ago=${current_ip}:${port}|aft=${resolved_ip}:${port}|same"
+    fi
+}
+
+get_public_ip() {
+    local urls="$1"
+    local url
+    for url in $urls; do
+        local ip
+        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        if [ -n "$ip" ]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+get_public_ip_v6() {
+    local urls="$1"
+    local url
+    for url in $urls; do
+        local ip
+        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | grep -oiE '[0-9a-f]{1,4}:[0-9a-f]{1,4}:[0-9a-f]{1,4}:[0-9a-f]{1,4}:' | head -n1 | tr '[:upper:]' '[:lower:]')
+        if [ -n "$ip" ]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+run_server() {
+    local name="$1"
+    load_peer "$name" || return 1
+
+    local new_ip
+    new_ip=$(get_public_ip "$CHECK_IP_URLS_V4")
+    if [ -z "$new_ip" ]; then
+        log "Peer $name: ERROR - Failed to get public IPv4"
+        return 1
+    fi
+
+    local ip_file="/tmp/wg-du-ip.${INTERFACE}"
+    local last_ip=""
+    if [ -f "$ip_file" ]; then
+        last_ip=$(cat "$ip_file")
+    fi
+
+    if [ "$new_ip" != "$last_ip" ]; then
+        echo "$new_ip" > "$ip_file"
+        if ! wg set "$INTERFACE" peer "$PEER_PUBLIC_KEY" endpoint 0.0.0.0:0; then
+            log "Peer $name: ERROR - wg set endpoint 0.0.0.0:0 failed"
+            return 1
+        fi
+        log "Peer${name}|self|ago=${last_ip:-none}|aft=${new_ip}|diff"
+    else
+        log "Peer${name}|self|ago=${new_ip}|aft=${new_ip}|same"
+    fi
+}
+
 print_help() {
     cat << 'EOF'
 Usage / 用法:
-  wg-du                # Run DDNS update (for cron) / 执行DDNS更新（用于定时任务）
-  wg-du -h             # Show this help / 显示帮助
-  wg-du -p             # Print records with diff / 仅显示变动记录
-  wg-du -p -a          # Print all log records / 显示全部日志
-  wg-du -install       # Install to /usr/bin/wg-du (requires root) / 安装到系统路径（需root）
+  wg-du                Run DDNS update (for cron) / 执行DDNS更新（用于定时任务）
+  wg-du --setup        Interactive setup wizard / 交互式配置向导
+  wg-du --check        Check configuration for errors / 检查配置错误
+  wg-du -h             Show this help / 显示帮助
+  wg-du -p             Print records with diff / 仅显示变动记录
+  wg-du -p -a          Print all log records / 显示全部日志
 
-Cron Setup / 定时任务设置:
-  Edit: crontab -e
-  Add line: */5 * * * * wg-du
-  Verify: crontab -l
-
-Service Management / 服务管理:
-  [Linux systemd]: systemctl enable/start/status cron
-  [OpenWrt]: /etc/init.d/cron enable/start/status
+Setup Guide / 配置指引:
+  1. 在每个 [Peer] 段落添加 #name = xxx（必填）
+  2. 有 Endpoint 的 peer → client 角色
+  3. 无 Endpoint 的 peer → server 角色
+  4. 运行 wg-du --setup 完成配置
 EOF
 }
 
@@ -94,45 +343,259 @@ print_log() {
     fi
 }
 
-install_script() {
-    if [ "$(id -u)" != "0" ]; then
-        echo "Error: -install requires root privileges." >&2
-        echo "错误：-install 需要 root 权限。" >&2
+detect_config() {
+    CONFIG_FILE=""
+    CONFIG_TYPE=""
+    if [ -f /etc/wireguard/wg0.conf ]; then
+        CONFIG_FILE="/etc/wireguard/wg0.conf"
+        CONFIG_TYPE="wg"
+        echo "检测到 WireGuard 配置文件: $CONFIG_FILE"
+    elif [ -f /etc/config/network ]; then
+        CONFIG_FILE="/etc/config/network"
+        CONFIG_TYPE="openwrt"
+        echo "检测到 OpenWrt 配置文件: $CONFIG_FILE"
+    else
+        echo "错误: 未找到 wg0.conf 或 /etc/config/network" >&2
+        exit 1
+    fi
+}
+
+check_config() {
+    detect_config
+    parse_wg0_conf
+
+    local errors=0
+    local warnings=0
+
+    # Check 1: unnamed peers
+    if [ "$CONFIG_TYPE" = "wg" ]; then
+        local awk_out
+        awk_out=$(awk '
+        /^\[Peer\]/ { if (name == "" && pk != "") { print pk; c++ } name=""; pk=""; in_peer=1; next }
+        in_peer && /^[[:space:]]*#name[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); name=$0 }
+        in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); pk=$0 }
+        END { if (name == "" && pk != "") { print pk; c++ } print "COUNT:" c }
+        ' "$CONFIG_FILE")
+        local count_line
+        count_line=$(echo "$awk_out" | grep '^COUNT:' | head -1)
+        local unnamed_count="${count_line#COUNT:}"
+        echo "$awk_out" | grep -v '^COUNT:' | while read -r pk; do
+            echo "WARNING: Peer $pk 缺少 #name，请在对应的 [Peer] 段落添加 #name = xxx"
+        done
+        warnings=$((warnings + unnamed_count))
+    fi
+
+    # Check 2: verify each named peer
+    while IFS='|' read -r name pk ep aip pkp <&3; do
+        role=""
+        dns_server=""
+        eval "role=\$PEER_${name}_ROLE"
+        eval "dns_server=\$PEER_${name}_DNS_SERVER"
+
+        if [ -z "$role" ]; then
+            echo "INFO: Peer $name ($pk) 尚未配置，运行 wg-du --setup 完成配置"
+            continue
+        fi
+
+        if [ -n "$ep" ] && [ "$role" != "client" ]; then
+            echo "WARNING: Peer $name 配置了 Endpoint 但角色设为 $role，将按 client 处理"
+            warnings=$((warnings + 1))
+        fi
+
+        if [ -z "$ep" ] && [ "$role" != "server" ]; then
+            echo "WARNING: Peer $name 没有 Endpoint 但角色设为 $role，将按 server 处理"
+            warnings=$((warnings + 1))
+        fi
+
+        if [ "$role" = "client" ] && [ -z "$dns_server" ]; then
+            echo "ERROR: Peer $name 是 client 角色但未配置 DNS_SERVER"
+            errors=$((errors + 1))
+        fi
+    done 3< /tmp/wg-du-peers.$$
+    rm -f /tmp/wg-du-peers.$$
+
+    # Summary
+    echo ""
+    echo "=== 检查结果 ==="
+    echo "错误: $errors"
+    echo "警告: $warnings"
+    [ "$errors" -gt 0 ] && echo "请修复错误后重新运行 wg-du --check"
+}
+
+setup_cron() {
+    echo "是否添加 cron 定时任务（每2分钟执行一次）？(Y/n)"
+    read -r answer
+    case "$answer" in
+        n|N|no)
+            echo "跳过 cron 配置。请手动执行: crontab -e"
+            echo "添加: */2 * * * * wg-du"
+            return
+            ;;
+    esac
+
+    if command -v crontab >/dev/null 2>&1; then
+        (crontab -l 2>/dev/null | grep -v 'wg-du'; echo "*/2 * * * * wg-du") | crontab -
+        echo "Cron 任务已添加：每2分钟执行 wg-du"
+
+        if command -v systemctl >/dev/null 2>&1; then
+            local cron_running=0
+            for svc in cron crond; do
+                if systemctl is-active "$svc" >/dev/null 2>&1; then
+                    cron_running=1; break
+                fi
+            done
+            if [ "$cron_running" -eq 0 ]; then
+                echo "检测到 cron 服务未运行，尝试启动..."
+                for svc in cron crond; do
+                    systemctl enable "$svc" 2>/dev/null || true
+                    systemctl start "$svc" 2>/dev/null || true
+                done
+            fi
+        elif [ -f /etc/init.d/cron ]; then
+            /etc/init.d/cron enable 2>/dev/null || true
+            /etc/init.d/cron start 2>/dev/null || true
+        fi
+    else
+        echo "错误: 未找到 crontab 命令。请手动执行: crontab -e"
+        echo "添加: */2 * * * * wg-du"
+    fi
+}
+
+write_config() {
+    local entries="$1"
+    local script_path
+    if [ -f /usr/bin/wg-du ]; then
+        script_path="/usr/bin/wg-du"
+    else
+        script_path="$0"
+    fi
+
+    local tmpfile="/tmp/wg-du-write.$$"
+
+    awk '/^# === wg-du 配置区 ===$/{exit} {print}' "$script_path" > "$tmpfile"
+
+    echo "" >> "$tmpfile"
+    echo "# === wg-du 配置区 ===" >> "$tmpfile"
+    echo "# 增强配置：每个 peer 通过 #name 与 wg0.conf 关联" >> "$tmpfile"
+    echo "# 格式: PEER_<name>_ROLE=client|server" >> "$tmpfile"
+    echo "#       PEER_<name>_DNS_SERVER=<dns>  (client only, required)" >> "$tmpfile"
+    echo "#       PEER_<name>_PING_IP=<ip>      (client only, optional)" >> "$tmpfile"
+    echo "" >> "$tmpfile"
+
+    grep -E '^(INTERFACE|LOG_FILE|CHECK_IP_URLS_V4|CHECK_IP_URLS_V6)=' "$script_path" >> "$tmpfile"
+    echo "" >> "$tmpfile"
+
+    echo "$entries" >> "$tmpfile"
+
+    echo "# === wg-du 配置区结束 ===" >> "$tmpfile"
+
+    awk 'BEGIN{found=0} /^# === wg-du 配置区结束 ===$/{found=1;next} found{print}' "$script_path" >> "$tmpfile"
+
+    cp "$tmpfile" "$script_path"
+    chmod +x "$script_path"
+    rm -f "$tmpfile"
+    echo "配置已写入 $script_path"
+}
+
+setup_wizard() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "错误: 请以 root 身份运行 (sudo wg-du --setup)" >&2
         exit 1
     fi
 
-    TARGET="/usr/bin/wg-du"
-    if [ -e "$TARGET" ]; then
-        echo "File exists: $TARGET. Overwrite? (y/N)"
-        read -r confirm
-        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-            echo "Installation cancelled."
-            exit 0
-        fi
+    echo "=== wg-du v2.0 交互式配置向导 ==="
+    echo ""
+
+    detect_config
+
+    printf "检查 dig... "
+    if command -v dig >/dev/null 2>&1; then
+        echo "OK"
+    else
+        echo "未安装"
+        echo ""
+        echo "请先安装 dig:"
+        echo "  Debian/Ubuntu:  sudo apt install dnsutils"
+        echo "  OpenWrt:        opkg install bind-dig"
+        echo ""
+        printf "安装完成后，请重新运行 wg-du --setup。按 Enter 退出。"
+        read -r _
+        exit 1
     fi
 
-    mkdir -p /etc/wireguard
-    cp "$0" "$TARGET"
-    chmod +x "$TARGET"
-    echo "Installed to $TARGET"
+    parse_wg0_conf
 
-    cat << 'EOF'
+    CONFIG_ENTRIES=""
 
-Next Steps / 后续步骤:
-1. Configure your peers in the script header.
-   在脚本头部配置你的Peer信息。
-2. Set up cron job (copy and run):
-   设置定时任务（复制并执行）：
-      crontab -e
-   Then add this line:
-      */5 * * * * wg-du
-3. Verify cron:
-      crontab -l
+    while IFS='|' read -r name pk ep aip pkp <&3; do
+        echo ""
+        echo "=============================="
+        echo "配置 Peer: $name"
+        echo "  PublicKey: ${pk}"
+        [ -n "$ep" ] && echo "  Endpoint: $ep"
 
-Service Commands / 服务命令:
-- Linux (systemd): systemctl enable cron && systemctl start cron
-- OpenWrt: /etc/init.d/cron enable && /etc/init.d/cron start
-EOF
+        if [ -n "$ep" ]; then
+            local ep_host_only="${ep%:*}"
+            ep_host_only=$(echo "$ep_host_only" | sed 's/^\[//; s/\]$//')
+            if echo "$ep_host_only" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || \
+               echo "$ep_host_only" | grep -qE '^[0-9a-fA-F:]+$'; then
+                local role="client"
+                echo "  Endpoint 是 IP 地址，无需 DNS 监控 → 不写入配置"
+                continue
+            fi
+
+            local role="client"
+            echo "  检测到 Endpoint → 角色: client"
+            CONFIG_ENTRIES="${CONFIG_ENTRIES}PEER_${name}_ROLE=\"${role}\"
+"
+
+            printf "权威 DNS 服务器 (如 dns17.hichina.com): "
+            read -r dns
+            while [ -z "$dns" ]; do
+                printf "DNS 服务器不能为空: "
+                read -r dns
+            done
+            CONFIG_ENTRIES="${CONFIG_ENTRIES}PEER_${name}_DNS_SERVER=\"${dns}\"
+"
+
+            printf "Ping IP（握手触发，可选，直接回车跳过）: "
+            read -r ping_ip
+            if [ -n "$ping_ip" ]; then
+                CONFIG_ENTRIES="${CONFIG_ENTRIES}PEER_${name}_PING_IP=\"${ping_ip}\"
+"
+            fi
+        else
+            local role="server"
+            echo "  无 Endpoint → 角色: server"
+            CONFIG_ENTRIES="${CONFIG_ENTRIES}PEER_${name}_ROLE=\"${role}\"
+"
+        fi
+    done 3< /tmp/wg-du-peers.$$
+
+    rm -f /tmp/wg-du-peers.$$
+
+    echo ""
+    echo "=============================="
+    echo "即将写入以下配置到脚本头部："
+    echo "$CONFIG_ENTRIES"
+    printf "确认写入？(Y/n): "
+    read -r confirm
+    case "$confirm" in
+        n|N|no)
+            echo "配置已取消。"
+            exit 0
+            ;;
+    esac
+
+    write_config "$CONFIG_ENTRIES"
+
+    echo ""
+    echo "=============================="
+    setup_cron
+
+    echo ""
+    echo "=== 配置完成！ ==="
+    echo "wg-du 现在可以正常运行了。"
 }
 
 # =============================================================================
@@ -152,8 +615,12 @@ case "$1" in
         fi
         exit 0
         ;;
-    -install)
-        install_script
+    --check)
+        check_config
+        exit 0
+        ;;
+    --setup)
+        setup_wizard
         exit 0
         ;;
     "")
@@ -166,62 +633,31 @@ case "$1" in
         ;;
 esac
 
+check_deps
+
 # Auto-create log directory
 mkdir -p "$(dirname "$LOG_FILE")"
 
-peer_indices=$(set | grep -E '^PEER_[0-9]+_PUBLIC_KEY=' | sed 's/^PEER_\([0-9]*\)_PUBLIC_KEY=.*/\1/' | sort -n)
+trap 'rm -f /tmp/wg-du-peers.$$' EXIT INT TERM
 
-if [ -z "$peer_indices" ]; then
-    log "ERROR: No PEER_N_PUBLIC_KEY defined in configuration"
-    exit 1
-fi
+parse_wg0_conf
 
-for idx in $peer_indices; do
-    eval "public_key=\$PEER_${idx}_PUBLIC_KEY"
-    eval "endpoint_str=\$PEER_${idx}_ENDPOINT"
-    eval "dns_server=\$PEER_${idx}_DNS_SERVER"
+while IFS='|' read -r name pk ep aip pkp <&3; do
+    role=""
+    eval "role=\$PEER_${name}_ROLE"
+    [ -z "$role" ] && continue
 
-    if [ -z "$public_key" ] || [ -z "$endpoint_str" ] || [ -z "$dns_server" ]; then
-        log "Peer $idx: ERROR - Missing configuration"
-        exit 1
-    fi
-
-    domain="${endpoint_str%:*}"
-    port="${endpoint_str##*:}"
-    if [ "$domain" = "$endpoint_str" ]; then
-        log "Peer $idx: ERROR - Invalid endpoint format (expected domain:port)"
-        exit 1
-    fi
-
-    current_endpoint=$(get_current_endpoint "$public_key")
-    if [ -z "$current_endpoint" ]; then
-        log "Peer $idx: ERROR - Peer not found in wg show $INTERFACE output"
-        exit 1
-    fi
-
-    if echo "$current_endpoint" | grep -q '\['; then
-        current_ip=$(echo "$current_endpoint" | sed 's/^\[\([^]]*\)\]:[0-9]*$/\1/')
-        record_type="AAAA"
-    else
-        current_ip=$(echo "$current_endpoint" | cut -d: -f1)
-        record_type="A"
-    fi
-
-    resolved_ip=$(resolve_ip "$domain" "$dns_server" "$record_type")
-    if [ -z "$resolved_ip" ]; then
-        log "Peer $idx: ERROR - DNS query failed for $domain ($record_type via $dns_server)"
-        exit 1
-    fi
-
-    if [ "$resolved_ip" != "$current_ip" ]; then
-        if ! update_peer_endpoint "$public_key" "$resolved_ip" "$port"; then
-            log "Peer $idx: ERROR - wg set failed"
-            exit 1
-        fi
-        log "Peer${idx}|$domain|ago=${current_ip}:${port}|aft=${resolved_ip}:${port}|diff"
-    else
-        log "Peer${idx}|$domain|ago=${current_ip}:${port}|aft=${resolved_ip}:${port}|same"
-    fi
-done
+    case "$role" in
+        client)
+            run_client "$name"
+            ;;
+        server)
+            run_server "$name"
+            ;;
+        *)
+            log "Peer $name: ERROR - Unknown role: $role"
+            ;;
+    esac
+done 3< /tmp/wg-du-peers.$$
 
 exit 0
