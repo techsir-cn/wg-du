@@ -7,8 +7,8 @@ WireGuard 动态更新（Dynamic Update）
 
 **WireGuard 动态更新**  
 **说明：自动检测公网 IP 变动，动态更新 WireGuard Peer Endpoint，无需重启接口**  
-**版本：v2.0**  
-**最后更新：2026-06-13**
+**版本：v2.1**  
+**最后更新：2026-06-16**
 
 ---
 
@@ -32,6 +32,8 @@ v2.0 新增 **server 角色**——不仅能监控对端域名 IP（client），
 | **IP 版本严格匹配** | IPv4 → A 记录；IPv6 → AAAA 记录 |
 | **公网 IP 检测** | 多 URL 轮询获取本机公网 IPv4/IPv6 |
 | **零中断更新** | `wg set` 动态更新，无需重启接口 |
+| **端口 roaming 防护** | 自动检测并修正 NAT 导致的端口漂移 |
+| **日志压缩** | 连续相同状态的日志仅保留首尾两条，不重复追加 |
 
 ---
 
@@ -110,7 +112,7 @@ AllowedIPs = 10.10.10.3/32
 
 ### 5.1 Client 模式
 
-1. 从 `wg show` 获取当前 Endpoint IP
+1. 从 `wg show` 获取当前 Endpoint，**优先检测端口是否被 roaming 漂移**——若端口与预期不一致，先用 `wg set` 修正端口再继续
 2. 判定 IP 版本，用 `dig` 查询对应 A/AAAA 记录
 3. 若 IP 不同，执行 `wg set` 更新 Endpoint
 4. 如果配置了 PING_IP，更新后 Ping 触发握手
@@ -133,8 +135,8 @@ AllowedIPs = 10.10.10.3/32
 YYYY-MM-DD_HH:MM:SS|PeerName|domain|ago=IP:PORT|aft=IP:PORT|same/diff
 ```
 
-- `|diff` 表示执行了更新
-- `|same` 表示 IP 无变化
+- `|diff` 表示执行了更新（IP 变化或端口漂移修正）
+- `|same` 表示无变化——连续相同状态的日志不重复追加，仅更新末条时间戳（同一 peer 同一状态最多保留首条和末条两行）
 
 ---
 
@@ -146,8 +148,7 @@ YYYY-MM-DD_HH:MM:SS|PeerName|domain|ago=IP:PORT|aft=IP:PORT|same/diff
 | `wg-du --setup` | 交互式配置向导 |
 | `wg-du --check` | 检查配置错误 |
 | `wg-du -h` | 显示帮助 |
-| `wg-du -p` | 仅显示变动记录 |
-| `wg-du -p -a` | 显示全部日志 |
+| `wg-du -p` | 查看日志 |
 
 ---
 
@@ -166,13 +167,13 @@ YYYY-MM-DD_HH:MM:SS|PeerName|domain|ago=IP:PORT|aft=IP:PORT|same/diff
 ### 步骤 1：下载脚本
 
 ```sh
-wget https://github.com/techsir-cn/wg-du/releases/download/v2.0/wg-du -O wg-du && chmod +x wg-du
+wget https://github.com/techsir-cn/wg-du/releases/download/v2.1/wg-du -O wg-du && chmod +x wg-du
 ```
 
 加速下载：
 
 ```sh
-wget https://ghfast.top/https://github.com/techsir-cn/wg-du/releases/download/v2.0/wg-du -O wg-du && chmod +x wg-du
+wget https://ghfast.top/https://github.com/techsir-cn/wg-du/releases/download/v2.1/wg-du -O wg-du && chmod +x wg-du
 ```
 
 ### 步骤 2：在 wg0.conf 中添加 #name
@@ -208,8 +209,7 @@ opkg update && opkg install bind-dig
 ### 步骤 5：查看日志与状态
 
 ```sh
-wg-du -p        # 查看变动记录
-wg-du -p -a     # 查看全部日志
+wg-du -p        # 查看日志
 cat /etc/wireguard/wg-du.log
 ```
 
@@ -219,6 +219,7 @@ cat /etc/wireguard/wg-du.log
 
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
+| v2.1 | 2026-06-16 | 新增端口 roaming 防护（`run_client` 自动检测端口漂移并修正）；日志压缩（`log_same`：连续相同状态仅更新末条时间戳，不追加）；`-p` 简化为直接查看日志；删除 `print_log` 函数和 `-p -a` 参数 |
 | v2.0 | 2026-06-13 | 重构为双角色架构（client/server）；自动从 wg0.conf 解析 Peer（#name 标记）；新增 `--setup` 交互式配置向导；新增 `--check` 配置检查；新增 server 模式公网 IP 检测；新增 OpenWrt `/etc/config/network` 支持；依赖新增 curl/ping |
 | v1.2 | 2026-02-27 | 日志格式优化：去除空格和标识，新增端口记录，ago/aft 字段 |
 | v1.1 | 2026-02-19 | 项目更名为 wg-du；日志标识简化为 same/diff；支持命令行选项 |
